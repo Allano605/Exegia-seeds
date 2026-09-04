@@ -1,161 +1,196 @@
 """
 Seed `cross_references` from the Treasury of Scripture Knowledge dataset.
 
-CORRECTED SCHEMA UNDERSTANDING (fixed 2026-09-04 after the first live run
-failed with a 404, which led to properly confirming the real file structure
-instead of re-guessing): the real `cross_reference` table does NOT use book
-NAME strings as this script originally assumed. It uses a compact NUMERIC
-verse-id: BOOK(2 digits) + CHAPTER(3 digits) + VERSE(3 digits), e.g.
-Genesis 1:1 = 01001001, Exodus 2:3 = 02002003 — confirmed directly from the
-source project's own README ("Verse ID System" section, revans/bible_databases
-and geauxtigers/bible_databases, both long-lived forks of the original
-scrollmapper project predating its 2025 schema rewrite). Book numbers 1-66
-follow the standard Protestant canon order (1=Genesis ... 66=Revelation),
-which matches this project's own `books.book_order` column directly — no
-name-matching needed, just decode the digits.
+FIXED 2026-09-04: after several attempts chasing third-party SQL mirrors that
+kept 404ing or had unreliable structure, this script now goes straight to the
+PRIMARY source instead. Fetched directly from openbible.info's own live page
+(https://www.openbible.info/labs/cross-references/) moments ago, which
+contains this exact real download link in its own HTML:
 
-The MySQL dump's INSERT statements for this table are therefore 4-column
-tuples: (id, from_id, to_id, votes) — NOT the 9-column
-(id, from_book, from_chapter, from_verse, to_book, to_chapter, to_verse,
-to_verse_end, votes) shape this script originally assumed. Fixed below.
+    "Download all the cross-reference data (2 MB .zip)"
+    -> https://a.openbible.info/data/cross-references.zip
 
-File location: `cross_references-mysql.sql` at the REPO ROOT — confirmed
-directly from two independent forks' own file listings (not the original
-scrollmapper/bible_databases repo, whose exact branch/path for this era
-couldn't be pinned down after multiple attempts — these forks are
-long-standing, well-known mirrors of the same original project and MIT
-licensed same as the original).
+This is the actual, current, first-party link -- not a guess, not a mirror.
+Confirmed real by fetching the live page and reading the href directly.
 
-License: CC BY — attribution to openbible.info required in-app. Underlying TSK
-data itself is public domain.
+Inside the zip is a tab-separated text file with columns for From Verse,
+To Verse, and Votes, using dotted OSIS-style book abbreviations with
+range notation for multi-verse spans (e.g. "Gen.1.1-Gen.1.3"). The exact
+header/column names and book-abbreviation scheme were NOT independently
+re-verified against the actual unzipped file contents this session (this
+fetch only confirmed the download link itself works, not what's inside it)
+-- this script reads the header row and prints it, and reports any book
+abbreviation it can't map, so a mismatch is visible immediately rather than
+silently producing wrong or zero results.
+
+License: CC BY (Creative Commons Attribution), confirmed directly from the
+same live page. Underlying TSK data itself is public domain.
 
 Run: python seed_tsk_crossrefs.py
 """
-import re
+import csv
+import io
+import zipfile
 import requests
 from tqdm import tqdm
 from _client import supabase, batch_upsert
 
-# Real, confirmed-to-exist mirrors of the original scrollmapper project, both
-# describing this exact file at repo root in their own file listings.
-CANDIDATE_URLS = [
-    "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/revans/bible_databases/master/cross_references-mysql.sql",
-]
+ZIP_URL = "https://a.openbible.info/data/cross-references.zip"
 
-# Matches: (id, from_id, to_id, votes) — all four are plain integers.
-INSERT_ROW_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)")
+# Common OSIS-style abbreviation variants seen across Bible data projects --
+# maps to this project's own osis_code (see books_data.py). Includes a few
+# alternate spellings in case openbible.info's scheme differs slightly from
+# ours; unmapped abbreviations are reported explicitly rather than silently
+# dropped.
+BOOK_ABBR_MAP = {
+    "Gen": "Gen", "Exod": "Exod", "Exo": "Exod", "Lev": "Lev", "Num": "Num",
+    "Deut": "Deut", "Deu": "Deut", "Josh": "Josh", "Jos": "Josh", "Judg": "Judg",
+    "Jdg": "Judg", "Ruth": "Ruth", "Rut": "Ruth", "1Sam": "1Sam", "1Sa": "1Sam",
+    "2Sam": "2Sam", "2Sa": "2Sam", "1Kgs": "1Kgs", "1Ki": "1Kgs", "2Kgs": "2Kgs",
+    "2Ki": "2Kgs", "1Chr": "1Chr", "1Ch": "1Chr", "2Chr": "2Chr", "2Ch": "2Chr",
+    "Ezra": "Ezra", "Ezr": "Ezra", "Neh": "Neh", "Esth": "Esth", "Est": "Esth",
+    "Job": "Job", "Ps": "Ps", "Psa": "Ps", "Psalm": "Ps", "Prov": "Prov",
+    "Pro": "Prov", "Eccl": "Eccl", "Ecc": "Eccl", "Song": "Song", "Sol": "Song",
+    "SS": "Song", "Isa": "Isa", "Jer": "Jer", "Lam": "Lam", "Ezek": "Ezek",
+    "Eze": "Ezek", "Dan": "Dan", "Hos": "Hos", "Joel": "Joel", "Joe": "Joel",
+    "Amos": "Amos", "Amo": "Amos", "Obad": "Obad", "Oba": "Obad", "Jonah": "Jonah",
+    "Jon": "Jonah", "Mic": "Mic", "Nah": "Nah", "Hab": "Hab", "Zeph": "Zeph",
+    "Zep": "Zeph", "Hag": "Hag", "Zech": "Zech", "Zec": "Zech", "Mal": "Mal",
+    "Matt": "Matt", "Mat": "Matt", "Mark": "Mark", "Mar": "Mark", "Luke": "Luke",
+    "Luk": "Luke", "John": "John", "Joh": "John", "Acts": "Acts", "Act": "Acts",
+    "Rom": "Rom", "1Cor": "1Cor", "1Co": "1Cor", "2Cor": "2Cor", "2Co": "2Cor",
+    "Gal": "Gal", "Eph": "Eph", "Phil": "Phil", "Php": "Phil", "Col": "Col",
+    "1Thess": "1Thess", "1Th": "1Thess", "2Thess": "2Thess", "2Th": "2Thess",
+    "1Tim": "1Tim", "1Ti": "1Tim", "2Tim": "2Tim", "2Ti": "2Tim", "Titus": "Titus",
+    "Tit": "Titus", "Phlm": "Phlm", "Phm": "Phlm", "Heb": "Heb", "Jas": "Jas",
+    "1Pet": "1Pet", "1Pe": "1Pet", "2Pet": "2Pet", "2Pe": "2Pet", "1John": "1John",
+    "1Jo": "1John", "1Jn": "1John", "2John": "2John", "2Jo": "2John", "2Jn": "2John",
+    "3John": "3John", "3Jo": "3John", "3Jn": "3John", "Jude": "Jude", "Jud": "Jude",
+    "Rev": "Rev",
+}
 
 
-def decode_verse_id(numeric_id):
-    """01001001 -> (book_order=1, chapter=1, verse=1)."""
-    s = str(numeric_id).zfill(8)
-    book_order = int(s[0:2])
-    chapter = int(s[2:5])
-    verse = int(s[5:8])
-    return book_order, chapter, verse
-
-
-def get_verse_id_map():
-    """canonical (book_id, chapter, verse) -> our internal verses.id, plus
-    book_order -> book_id."""
-    books_resp = supabase.table("books").select("id, book_order").execute()
-    book_id_by_order = {row["book_order"]: row["id"] for row in books_resp.data}
-
-    verse_map = {}
-    start = 0
-    page_size = 1000
-    while True:
-        resp = (
-            supabase.table("verses")
-            .select("id, book_id, chapter, verse")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        if not resp.data:
-            break
-        for row in resp.data:
-            verse_map[(row["book_id"], row["chapter"], row["verse"])] = row["id"]
-        if len(resp.data) < page_size:
-            break
-        start += page_size
-
-    return book_id_by_order, verse_map
+def parse_ref(ref):
+    """'Gen.1.1' or 'Gen.1.1-Gen.1.3' (range -> take first verse only) ->
+    (osis_code, chapter, verse), or (None, book_abbr) if the book abbreviation
+    is unmapped, or None if the string can't be parsed at all."""
+    if not ref:
+        return None
+    first = ref.split("-")[0].strip()
+    parts = first.split(".")
+    if len(parts) != 3:
+        return None
+    book_abbr, chapter, verse = parts
+    osis_code = BOOK_ABBR_MAP.get(book_abbr)
+    if not osis_code:
+        return None, book_abbr
+    try:
+        return osis_code, int(chapter), int(verse)
+    except ValueError:
+        return None
 
 
 def run():
-    print("Loading book and verse maps...")
-    book_id_by_order, verse_map = get_verse_id_map()
-    if not verse_map:
-        raise RuntimeError("verses table is empty — run seed_kjv.py first.")
-    print(f"  loaded {len(book_id_by_order)} books, {len(verse_map)} verses")
+    print("Fetching TSK cross-references zip from openbible.info (primary source)...")
+    resp = requests.get(ZIP_URL, timeout=120)
+    resp.raise_for_status()
+    print(f"  downloaded {len(resp.content) / 1e6:.2f} MB")
 
-    print("Fetching TSK cross-references SQL dump...")
-    sql_text = None
-    working_url = None
-    for url in CANDIDATE_URLS:
-        try:
-            resp = requests.get(url, timeout=120)
-            if resp.status_code == 200 and len(resp.text) > 1000:
-                sql_text = resp.text
-                working_url = url
-                print(f"  found it at: {url}")
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    names = zf.namelist()
+    print(f"  zip contains: {names}")
+    txt_name = next((n for n in names if n.endswith(".txt")), names[0])
+    print(f"  reading: {txt_name}")
+
+    with zf.open(txt_name) as f:
+        text = io.TextIOWrapper(f, encoding="utf-8")
+        reader = csv.reader(text, delimiter="\t")
+        header = next(reader)
+        print(f"  header row: {header}")
+
+        books_resp = supabase.table("books").select("id, osis_code").execute()
+        osis_to_book_id = {row["osis_code"]: row["id"] for row in books_resp.data}
+
+        verse_map = {}
+        start = 0
+        page_size = 1000
+        while True:
+            vresp = (
+                supabase.table("verses")
+                .select("id, book_id, chapter, verse")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            if not vresp.data:
                 break
-            else:
-                print(f"  x {url} -> HTTP {resp.status_code}")
-        except requests.RequestException as e:
-            print(f"  x {url} -> {e}")
+            for row in vresp.data:
+                verse_map[(row["book_id"], row["chapter"], row["verse"])] = row["id"]
+            if len(vresp.data) < page_size:
+                break
+            start += page_size
 
-    if sql_text is None:
+        if not verse_map:
+            raise RuntimeError("verses table is empty -- run seed_kjv.py first.")
+        print(f"  loaded {len(verse_map)} verses for matching")
+
+        rows = []
+        skipped = 0
+        unmapped_abbrs = set()
+        for line in tqdm(reader, desc="Parsing"):
+            if len(line) < 3:
+                continue
+            from_ref, to_ref, votes = line[0], line[1], line[2]
+
+            from_parsed = parse_ref(from_ref)
+            to_parsed = parse_ref(to_ref)
+
+            if isinstance(from_parsed, tuple) and len(from_parsed) == 2 and from_parsed[0] is None:
+                unmapped_abbrs.add(from_parsed[1])
+                skipped += 1
+                continue
+            if isinstance(to_parsed, tuple) and len(to_parsed) == 2 and to_parsed[0] is None:
+                unmapped_abbrs.add(to_parsed[1])
+                skipped += 1
+                continue
+            if not from_parsed or not to_parsed:
+                skipped += 1
+                continue
+
+            from_osis, from_ch, from_v = from_parsed
+            to_osis, to_ch, to_v = to_parsed
+            from_book_id = osis_to_book_id.get(from_osis)
+            to_book_id = osis_to_book_id.get(to_osis)
+            from_vid = verse_map.get((from_book_id, from_ch, from_v))
+            to_vid = verse_map.get((to_book_id, to_ch, to_v))
+            if not from_vid or not to_vid:
+                skipped += 1
+                continue
+
+            try:
+                rank = int(votes)
+            except ValueError:
+                rank = None
+
+            rows.append(
+                {
+                    "from_verse_id": from_vid,
+                    "to_verse_id": to_vid,
+                    "source": "tsk",
+                    "relevance_rank": rank,
+                }
+            )
+
+    print(f"  parsed {len(rows)} cross-references ({skipped} skipped)")
+    if unmapped_abbrs:
+        print(f"  unmapped book abbreviations encountered: {sorted(unmapped_abbrs)} -- "
+              f"add these to BOOK_ABBR_MAP if the count seems high")
+
+    if not rows:
         raise RuntimeError(
-            "None of the candidate URLs worked. Manually check "
-            "https://github.com/geauxtigers/bible_databases in a browser "
-            "for the real current file path and add it to CANDIDATE_URLS."
-        )
-    print(f"  downloaded {len(sql_text) / 1e6:.1f} MB from {working_url}")
-
-    # Narrow to just the cross_reference table's INSERT block if the dump
-    # contains multiple tables, so the regex doesn't accidentally match
-    # unrelated numeric tuples elsewhere in the file.
-    table_start = sql_text.lower().find("insert into `cross_reference`")
-    if table_start == -1:
-        table_start = sql_text.lower().find("insert into cross_reference")
-    search_text = sql_text[table_start:] if table_start != -1 else sql_text
-
-    matches = INSERT_ROW_RE.findall(search_text)
-    print(f"  regex matched {len(matches)} candidate rows")
-    if not matches:
-        raise RuntimeError(
-            "0 rows matched -- the INSERT statement format differs from what "
-            "INSERT_ROW_RE expects. Inspect the first part of the downloaded "
-            "file to see the real format and adjust the regex."
+            "0 cross-references parsed -- check the printed header row and sample "
+            "abbreviations above against BOOK_ABBR_MAP and parse_ref()."
         )
 
-    rows = []
-    skipped = 0
-    for id_str, from_id_str, to_id_str, votes_str in tqdm(matches, desc="Mapping"):
-        from_book_order, from_ch, from_v = decode_verse_id(from_id_str)
-        to_book_order, to_ch, to_v = decode_verse_id(to_id_str)
-
-        from_book_id = book_id_by_order.get(from_book_order)
-        to_book_id = book_id_by_order.get(to_book_order)
-        from_vid = verse_map.get((from_book_id, from_ch, from_v))
-        to_vid = verse_map.get((to_book_id, to_ch, to_v))
-        if not from_vid or not to_vid:
-            skipped += 1
-            continue
-
-        rows.append(
-            {
-                "from_verse_id": from_vid,
-                "to_verse_id": to_vid,
-                "source": "tsk",
-                "relevance_rank": int(votes_str),
-            }
-        )
-
-    print(f"  mapped {len(rows)} cross-references ({skipped} skipped -- book/verse not matched, "
-          f"expected for any refs outside the 66-book canon)")
     batch_upsert("cross_references", rows, on_conflict="from_verse_id,to_verse_id,source")
     print("TSK cross-reference seeding complete.")
 
