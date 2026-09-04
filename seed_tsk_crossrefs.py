@@ -37,11 +37,6 @@ from _client import supabase, batch_upsert
 
 ZIP_URL = "https://a.openbible.info/data/cross-references.zip"
 
-# Common OSIS-style abbreviation variants seen across Bible data projects --
-# maps to this project's own osis_code (see books_data.py). Includes a few
-# alternate spellings in case openbible.info's scheme differs slightly from
-# ours; unmapped abbreviations are reported explicitly rather than silently
-# dropped.
 BOOK_ABBR_MAP = {
     "Gen": "Gen", "Exod": "Exod", "Exo": "Exod", "Lev": "Lev", "Num": "Num",
     "Deut": "Deut", "Deu": "Deut", "Josh": "Josh", "Jos": "Josh", "Judg": "Judg",
