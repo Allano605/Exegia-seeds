@@ -1,3 +1,7 @@
+Line 1: import sys
+Line 2: import csv
+Line 3: csv.field_size_limit(sys.maxsize)
+Line 4: your old Line 1 starts here...
 import csv, gzip, io, json, sys, requests
 from tqdm import tqdm
 from _client import supabase
