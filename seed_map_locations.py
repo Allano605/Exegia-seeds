@@ -85,7 +85,6 @@ def _flatten_coords(coords):
     LineString vs Polygon vs Multi* all nest differently)."""
     if not coords:
         return []
-    # A coordinate pair looks like [number, number] -- two plain numbers.
     if len(coords) == 2 and all(isinstance(c, (int, float)) for c in coords):
         return [coords]
     pairs = []
@@ -119,20 +118,12 @@ def run():
     places = download_csv_gz(PLACES_URL, "Pleiades places")
     locations = download_csv_gz(LOCATIONS_URL, "Pleiades locations")
 
-    # Index places by lowercased title for matching.
     places_by_title = {}
     for p in places:
         title = (p.get("title") or "").strip().lower()
         if title and title not in places_by_title:
-            places_by_title[title] = p  # first match wins
+            places_by_title[title] = p
 
-    # Index locations by pid (place id) so we can pull coordinates.
-    # NOTE: places.id and locations.pid may not be in identical string formats
-    # (e.g. one could be a bare number, the other a full pleiades.stoa.org URI,
-    # or have trailing whitespace/slashes) — normalize both to their trailing
-    # numeric/alnum segment before joining, rather than assuming exact string
-    # equality, since an exact-match join silently returning zero rows (as it
-    # did on the actual first live run) is worse than a slightly looser join.
     def normalize_id(raw_id):
         if not raw_id:
             return None
@@ -142,11 +133,8 @@ def run():
     for loc in locations:
         pid = normalize_id(loc.get("pid"))
         if pid and pid not in locations_by_pid:
-            locations_by_pid[pid] = loc  # first published location for this place
+            locations_by_pid[pid] = loc
 
-    # Diagnostic: show what real id/pid formats actually look like, so a
-    # mismatch is visible immediately instead of silently producing zero
-    # matches like it did on the first live run.
     if places:
         sample_place_id = places[0].get("id")
         print(f"  sample places.id format: {sample_place_id!r}")
@@ -192,26 +180,17 @@ def run():
             print(f"  - {u}")
 
     if not rows:
-        # This is exactly what silently happened on the first live run: 0
-        # matches, no error, and run_all_seeds.py reported it as "succeeded"
-        # since no exception was raised — then journeys failed downstream
-        # with a confusing "map_locations is empty" instead of pointing at
-        # the real cause. Raise loudly instead so the failure is obvious here.
         raise RuntimeError(
             "Matched 0 places — the places/locations join is broken. Check the "
             "sample id/pid formats printed above against each other."
         )
 
-    if rows:
-        # map_locations has no unique constraint beyond the serial id, so —
-        # same reasoning as seed_commentaries.py — check by name before
-        # inserting rather than fake-upserting against a nonexistent constraint.
-        existing_resp = supabase.table("map_locations").select("name").execute()
-        existing_names = {r["name"] for r in existing_resp.data}
-        new_rows = [r for r in rows if r["name"] not in existing_names]
-        for i in range(0, len(new_rows), 500):
-            supabase.table("map_locations").insert(new_rows[i:i + 500]).execute()
-        print(f"Inserted {len(new_rows)} new locations ({len(rows) - len(new_rows)} already existed).")
+    existing_resp = supabase.table("map_locations").select("name").execute()
+    existing_names = {r["name"] for r in existing_resp.data}
+    new_rows = [r for r in rows if r["name"] not in existing_names]
+    for i in range(0, len(new_rows), 500):
+        supabase.table("map_locations").insert(new_rows[i:i + 500]).execute()
+    print(f"Inserted {len(new_rows)} new locations ({len(rows) - len(new_rows)} already existed).")
 
     print("Map location seeding complete.")
 
