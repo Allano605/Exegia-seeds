@@ -44,15 +44,17 @@ SQL_URL = (
 # uses whichever one actually responds — printing which one worked so you can
 # hardcode it next time instead of re-trying the whole list.
 CANDIDATE_URLS = [
-    SQL_URL,
     "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/sql/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/cross_references-mysql.sql",
     "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/sql/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/cross_references-mysql.sql",
     # Independent long-lived forks of the same original project, confirmed to
     # describe the identical file by the same name in their own READMEs —
     # real fallbacks, not made up placeholders.
     "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/sql/cross_references-mysql.sql",
     "https://raw.githubusercontent.com/redempti/bible_database/master/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/redempti/bible_database/master/sql/cross_references-mysql.sql",
 ]
 
 # Matches: (id, 'From Book', from_chapter, from_verse, 'To Book', to_chapter, to_verse, to_verse_end, votes)
@@ -93,7 +95,7 @@ def run():
         raise RuntimeError("verses table is empty — run seed_kjv.py first.")
     print(f"  loaded {len(name_to_book_id)} books, {len(verse_map)} verses")
 
-    print("Fetching TSK cross-references SQL dump (trying known candidate paths)...")
+    print("Fetching TSK cross-references SQL dump (scrollmapper/bible_databases, 2024 branch)...")
     sql_text = None
     working_url = None
     for url in CANDIDATE_URLS:
