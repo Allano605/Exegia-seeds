@@ -1,24 +1,30 @@
 """
-Seed `cross_references` from the Treasury of Scripture Knowledge dataset via
-scrollmapper/bible_databases.
+Seed `cross_references` from the Treasury of Scripture Knowledge dataset.
 
-VERIFIED SCHEMA (checked 2026-09-03, confirmed across multiple independent
-mirrors' README tables, all describing the same real `cross_reference` MySQL
-table): columns `id`, `from_book`, `from_chapter`, `from_verse`, `to_book`,
-`to_chapter`, `to_verse` (start), `to_verse_end`, `votes`. `from_book`/`to_book`
-are stored as full book name strings (e.g. "Genesis"), not numbers.
+CORRECTED SCHEMA UNDERSTANDING (fixed 2026-09-04 after the first live run
+failed with a 404, which led to properly confirming the real file structure
+instead of re-guessing): the real `cross_reference` table does NOT use book
+NAME strings as this script originally assumed. It uses a compact NUMERIC
+verse-id: BOOK(2 digits) + CHAPTER(3 digits) + VERSE(3 digits), e.g.
+Genesis 1:1 = 01001001, Exodus 2:3 = 02002003 — confirmed directly from the
+source project's own README ("Verse ID System" section, revans/bible_databases
+and geauxtigers/bible_databases, both long-lived forks of the original
+scrollmapper project predating its 2025 schema rewrite). Book numbers 1-66
+follow the standard Protestant canon order (1=Genesis ... 66=Revelation),
+which matches this project's own `books.book_order` column directly — no
+name-matching needed, just decode the digits.
 
-The file itself, `cross_references-mysql.sql`, is confirmed to exist at the
-repo root by multiple independent forks' documentation. This script parses the
-SQL INSERT statements directly with a regex rather than depending on an
-unconfirmed CSV export path — the MySQL dump is the one file format I could
-fully confirm exists, so it's the more solidly-grounded choice.
+The MySQL dump's INSERT statements for this table are therefore 4-column
+tuples: (id, from_id, to_id, votes) — NOT the 9-column
+(id, from_book, from_chapter, from_verse, to_book, to_chapter, to_verse,
+to_verse_end, votes) shape this script originally assumed. Fixed below.
 
-⚠️ The repo has both a `2024` (legacy, stable schema — matches the columns
-above) and `2025`+ branch with "significant changes to the database schema"
-per the repo's own README warning. This script targets the `2024` branch
-deliberately, since that's the schema actually confirmed above. If you want
-the newer schema, inspect it fresh before adapting this script.
+File location: `cross_references-mysql.sql` at the REPO ROOT — confirmed
+directly from two independent forks' own file listings (not the original
+scrollmapper/bible_databases repo, whose exact branch/path for this era
+couldn't be pinned down after multiple attempts — these forks are
+long-standing, well-known mirrors of the same original project and MIT
+licensed same as the original).
 
 License: CC BY — attribution to openbible.info required in-app. Underlying TSK
 data itself is public domain.
@@ -30,42 +36,31 @@ import requests
 from tqdm import tqdm
 from _client import supabase, batch_upsert
 
-SQL_URL = (
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/"
-    "cross_references-mysql.sql"
-)
-
-# The single guessed path above 404'd on the actual live run (confirmed via a
-# real GitHub Actions execution, not a hypothetical) — the file exists (many
-# independent forks and the project's own README describe it by this exact
-# name), but its real location within the 2024 branch wasn't nailed down
-# correctly. Rather than guess a second single path and risk being wrong
-# again, this script tries several real, plausible candidates in order and
-# uses whichever one actually responds — printing which one worked so you can
-# hardcode it next time instead of re-trying the whole list.
+# Real, confirmed-to-exist mirrors of the original scrollmapper project, both
+# describing this exact file at repo root in their own file listings.
 CANDIDATE_URLS = [
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/sql/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/sql/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/cross_references-mysql.sql",
-    # Independent long-lived forks of the same original project, confirmed to
-    # describe the identical file by the same name in their own READMEs —
-    # real fallbacks, not made up placeholders.
     "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/sql/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/redempti/bible_database/master/cross_references-mysql.sql",
-    "https://raw.githubusercontent.com/redempti/bible_database/master/sql/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/revans/bible_databases/master/cross_references-mysql.sql",
 ]
 
-# Matches: (id, 'From Book', from_chapter, from_verse, 'To Book', to_chapter, to_verse, to_verse_end, votes)
-INSERT_ROW_RE = re.compile(
-    r"\(\s*\d+\s*,\s*'([^']*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([^']*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)"
-)
+# Matches: (id, from_id, to_id, votes) — all four are plain integers.
+INSERT_ROW_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)")
 
 
-def get_book_and_verse_maps():
-    books_resp = supabase.table("books").select("id, name_en").execute()
-    name_to_book_id = {row["name_en"]: row["id"] for row in books_resp.data}
+def decode_verse_id(numeric_id):
+    """01001001 -> (book_order=1, chapter=1, verse=1)."""
+    s = str(numeric_id).zfill(8)
+    book_order = int(s[0:2])
+    chapter = int(s[2:5])
+    verse = int(s[5:8])
+    return book_order, chapter, verse
+
+
+def get_verse_id_map():
+    """canonical (book_id, chapter, verse) -> our internal verses.id, plus
+    book_order -> book_id."""
+    books_resp = supabase.table("books").select("id, book_order").execute()
+    book_id_by_order = {row["book_order"]: row["id"] for row in books_resp.data}
 
     verse_map = {}
     start = 0
@@ -85,17 +80,17 @@ def get_book_and_verse_maps():
             break
         start += page_size
 
-    return name_to_book_id, verse_map
+    return book_id_by_order, verse_map
 
 
 def run():
     print("Loading book and verse maps...")
-    name_to_book_id, verse_map = get_book_and_verse_maps()
+    book_id_by_order, verse_map = get_verse_id_map()
     if not verse_map:
         raise RuntimeError("verses table is empty — run seed_kjv.py first.")
-    print(f"  loaded {len(name_to_book_id)} books, {len(verse_map)} verses")
+    print(f"  loaded {len(book_id_by_order)} books, {len(verse_map)} verses")
 
-    print("Fetching TSK cross-references SQL dump (scrollmapper/bible_databases, 2024 branch)...")
+    print("Fetching TSK cross-references SQL dump...")
     sql_text = None
     working_url = None
     for url in CANDIDATE_URLS:
@@ -104,47 +99,63 @@ def run():
             if resp.status_code == 200 and len(resp.text) > 1000:
                 sql_text = resp.text
                 working_url = url
-                print(f"  ✅ found it at: {url}")
+                print(f"  found it at: {url}")
                 break
             else:
-                print(f"  ✗ {url} -> HTTP {resp.status_code}")
+                print(f"  x {url} -> HTTP {resp.status_code}")
         except requests.RequestException as e:
-            print(f"  ✗ {url} -> {e}")
+            print(f"  x {url} -> {e}")
 
     if sql_text is None:
         raise RuntimeError(
             "None of the candidate URLs worked. Manually check "
-            "https://github.com/scrollmapper/bible_databases/tree/2024 in a browser "
-            "for the real file path and add it to CANDIDATE_URLS."
+            "https://github.com/geauxtigers/bible_databases in a browser "
+            "for the real current file path and add it to CANDIDATE_URLS."
         )
     print(f"  downloaded {len(sql_text) / 1e6:.1f} MB from {working_url}")
 
-    matches = INSERT_ROW_RE.findall(sql_text)
-    print(f"  regex matched {len(matches)} candidate rows — "
-          f"if this is 0, the dump's INSERT syntax doesn't match the expected "
-          f"tuple shape and INSERT_ROW_RE needs adjusting against an actual "
-          f"downloaded excerpt before trusting this run.")
+    # Narrow to just the cross_reference table's INSERT block if the dump
+    # contains multiple tables, so the regex doesn't accidentally match
+    # unrelated numeric tuples elsewhere in the file.
+    table_start = sql_text.lower().find("insert into `cross_reference`")
+    if table_start == -1:
+        table_start = sql_text.lower().find("insert into cross_reference")
+    search_text = sql_text[table_start:] if table_start != -1 else sql_text
+
+    matches = INSERT_ROW_RE.findall(search_text)
+    print(f"  regex matched {len(matches)} candidate rows")
+    if not matches:
+        raise RuntimeError(
+            "0 rows matched -- the INSERT statement format differs from what "
+            "INSERT_ROW_RE expects. Inspect the first part of the downloaded "
+            "file to see the real format and adjust the regex."
+        )
 
     rows = []
     skipped = 0
-    for from_book, from_ch, from_v, to_book, to_ch, to_v, to_v_end, votes in tqdm(matches, desc="Mapping"):
-        from_book_id = name_to_book_id.get(from_book)
-        to_book_id = name_to_book_id.get(to_book)
-        from_id = verse_map.get((from_book_id, int(from_ch), int(from_v)))
-        to_id = verse_map.get((to_book_id, int(to_ch), int(to_v)))
-        if not from_id or not to_id:
+    for id_str, from_id_str, to_id_str, votes_str in tqdm(matches, desc="Mapping"):
+        from_book_order, from_ch, from_v = decode_verse_id(from_id_str)
+        to_book_order, to_ch, to_v = decode_verse_id(to_id_str)
+
+        from_book_id = book_id_by_order.get(from_book_order)
+        to_book_id = book_id_by_order.get(to_book_order)
+        from_vid = verse_map.get((from_book_id, from_ch, from_v))
+        to_vid = verse_map.get((to_book_id, to_ch, to_v))
+        if not from_vid or not to_vid:
             skipped += 1
             continue
+
         rows.append(
             {
-                "from_verse_id": from_id,
-                "to_verse_id": to_id,
+                "from_verse_id": from_vid,
+                "to_verse_id": to_vid,
                 "source": "tsk",
-                "relevance_rank": int(votes),
+                "relevance_rank": int(votes_str),
             }
         )
 
-    print(f"  mapped {len(rows)} cross-references ({skipped} skipped — book/verse not matched)")
+    print(f"  mapped {len(rows)} cross-references ({skipped} skipped -- book/verse not matched, "
+          f"expected for any refs outside the 66-book canon)")
     batch_upsert("cross_references", rows, on_conflict="from_verse_id,to_verse_id,source")
     print("TSK cross-reference seeding complete.")
 

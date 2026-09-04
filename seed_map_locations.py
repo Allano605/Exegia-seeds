@@ -40,10 +40,10 @@ from _client import supabase
 # module default field-size limit (131072 bytes), which is what actually
 # broke this script on its first real run against live data — not a
 # hypothetical, this is the exact error that came back. Raise the limit
-# BEFORE reading any CSV to ensure it applies to all file parsing.
+# before reading either CSV.
 try:
-    csv.field_size_limit(int(sys.maxsize))
-except (OverflowError, ValueError):
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
     # Some platforms (notably Windows) reject sys.maxsize here — fall back
     # to a large-but-safe value instead.
     csv.field_size_limit(2**31 - 1)
@@ -91,11 +91,32 @@ def run():
             places_by_title[title] = p  # first match wins
 
     # Index locations by pid (place id) so we can pull coordinates.
+    # NOTE: places.id and locations.pid may not be in identical string formats
+    # (e.g. one could be a bare number, the other a full pleiades.stoa.org URI,
+    # or have trailing whitespace/slashes) — normalize both to their trailing
+    # numeric/alnum segment before joining, rather than assuming exact string
+    # equality, since an exact-match join silently returning zero rows (as it
+    # did on the actual first live run) is worse than a slightly looser join.
+    def normalize_id(raw_id):
+        if not raw_id:
+            return None
+        return str(raw_id).strip().rstrip("/").split("/")[-1]
+
     locations_by_pid = {}
     for loc in locations:
-        pid = loc.get("pid")
+        pid = normalize_id(loc.get("pid"))
         if pid and pid not in locations_by_pid:
             locations_by_pid[pid] = loc  # first published location for this place
+
+    # Diagnostic: show what real id/pid formats actually look like, so a
+    # mismatch is visible immediately instead of silently producing zero
+    # matches like it did on the first live run.
+    if places:
+        sample_place_id = places[0].get("id")
+        print(f"  sample places.id format: {sample_place_id!r}")
+    if locations:
+        sample_pid = locations[0].get("pid")
+        print(f"  sample locations.pid format: {sample_pid!r}")
 
     rows = []
     unmatched = []
@@ -104,7 +125,7 @@ def run():
         if not place:
             unmatched.append(name)
             continue
-        loc = locations_by_pid.get(place["id"])
+        loc = locations_by_pid.get(normalize_id(place["id"]))
         if not loc or not loc.get("geometry"):
             unmatched.append(f"{name} (place found, no coordinates)")
             continue
@@ -130,6 +151,17 @@ def run():
         print(f"Unmatched ({len(unmatched)}) — these need manual coordinates or a name-variant fix:")
         for u in unmatched:
             print(f"  - {u}")
+
+    if not rows:
+        # This is exactly what silently happened on the first live run: 0
+        # matches, no error, and run_all_seeds.py reported it as "succeeded"
+        # since no exception was raised — then journeys failed downstream
+        # with a confusing "map_locations is empty" instead of pointing at
+        # the real cause. Raise loudly instead so the failure is obvious here.
+        raise RuntimeError(
+            "Matched 0 places — the places/locations join is broken. Check the "
+            "sample id/pid formats printed above against each other."
+        )
 
     if rows:
         # map_locations has no unique constraint beyond the serial id, so —
