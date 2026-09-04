@@ -31,9 +31,22 @@ import csv
 import gzip
 import io
 import json
+import sys
 import requests
 from tqdm import tqdm
 from _client import supabase
+
+# Pleiades place descriptions can be long enough to exceed Python's csv
+# module default field-size limit (131072 bytes), which is what actually
+# broke this script on its first real run against live data — not a
+# hypothetical, this is the exact error that came back. Raise the limit
+# before reading either CSV.
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    # Some platforms (notably Windows) reject sys.maxsize here — fall back
+    # to a large-but-safe value instead.
+    csv.field_size_limit(2**31 - 1)
 
 PLACES_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-places-latest.csv.gz"
 LOCATIONS_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-locations-latest.csv.gz"

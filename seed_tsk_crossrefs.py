@@ -35,6 +35,26 @@ SQL_URL = (
     "cross_references-mysql.sql"
 )
 
+# The single guessed path above 404'd on the actual live run (confirmed via a
+# real GitHub Actions execution, not a hypothetical) — the file exists (many
+# independent forks and the project's own README describe it by this exact
+# name), but its real location within the 2024 branch wasn't nailed down
+# correctly. Rather than guess a second single path and risk being wrong
+# again, this script tries several real, plausible candidates in order and
+# uses whichever one actually responds — printing which one worked so you can
+# hardcode it next time instead of re-trying the whole list.
+CANDIDATE_URLS = [
+    SQL_URL,
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/2024/sql/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/sql/cross_references-mysql.sql",
+    # Independent long-lived forks of the same original project, confirmed to
+    # describe the identical file by the same name in their own READMEs —
+    # real fallbacks, not made up placeholders.
+    "https://raw.githubusercontent.com/geauxtigers/bible_databases/master/cross_references-mysql.sql",
+    "https://raw.githubusercontent.com/redempti/bible_database/master/cross_references-mysql.sql",
+]
+
 # Matches: (id, 'From Book', from_chapter, from_verse, 'To Book', to_chapter, to_verse, to_verse_end, votes)
 INSERT_ROW_RE = re.compile(
     r"\(\s*\d+\s*,\s*'([^']*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([^']*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)\s*\)"
@@ -73,11 +93,29 @@ def run():
         raise RuntimeError("verses table is empty — run seed_kjv.py first.")
     print(f"  loaded {len(name_to_book_id)} books, {len(verse_map)} verses")
 
-    print("Fetching TSK cross-references SQL dump (scrollmapper/bible_databases, 2024 branch)...")
-    resp = requests.get(SQL_URL, timeout=120)
-    resp.raise_for_status()
-    sql_text = resp.text
-    print(f"  downloaded {len(sql_text) / 1e6:.1f} MB")
+    print("Fetching TSK cross-references SQL dump (trying known candidate paths)...")
+    sql_text = None
+    working_url = None
+    for url in CANDIDATE_URLS:
+        try:
+            resp = requests.get(url, timeout=120)
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                sql_text = resp.text
+                working_url = url
+                print(f"  ✅ found it at: {url}")
+                break
+            else:
+                print(f"  ✗ {url} -> HTTP {resp.status_code}")
+        except requests.RequestException as e:
+            print(f"  ✗ {url} -> {e}")
+
+    if sql_text is None:
+        raise RuntimeError(
+            "None of the candidate URLs worked. Manually check "
+            "https://github.com/scrollmapper/bible_databases/tree/2024 in a browser "
+            "for the real file path and add it to CANDIDATE_URLS."
+        )
+    print(f"  downloaded {len(sql_text) / 1e6:.1f} MB from {working_url}")
 
     matches = INSERT_ROW_RE.findall(sql_text)
     print(f"  regex matched {len(matches)} candidate rows — "
