@@ -40,10 +40,10 @@ from _client import supabase
 # module default field-size limit (131072 bytes), which is what actually
 # broke this script on its first real run against live data — not a
 # hypothetical, this is the exact error that came back. Raise the limit
-# before reading either CSV.
+# BEFORE reading any CSV to ensure it applies to all file parsing.
 try:
-    csv.field_size_limit(sys.maxsize)
-except OverflowError:
+    csv.field_size_limit(int(sys.maxsize))
+except (OverflowError, ValueError):
     # Some platforms (notably Windows) reject sys.maxsize here — fall back
     # to a large-but-safe value instead.
     csv.field_size_limit(2**31 - 1)
