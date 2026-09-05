@@ -1,28 +1,22 @@
 """
 Seed `map_locations` from the Pleiades gazetteer of ancient places.
 
-VERIFIED SOURCE (checked 2026-09-04, fetched the actual live download index
-and its README): https://atlantides.org/downloads/pleiades/dumps/
-  - pleiades-places-latest.csv.gz — place metadata (id, title, description,
-    featureTypes, timePeriods)
-  - pleiades-locations-latest.csv.gz — coordinates, joined to places via
-    locations.pid == places.id; geometry is a GeoJSON string.
-License: CC BY 3.0 (Ancient World Mapping Center / ISAW) — attribution
-required in-app.
+VERIFIED SOURCE: https://atlantides.org/downloads/pleiades/dumps/
+  - pleiades-places-latest.csv.gz -- place metadata
+  - pleiades-locations-latest.csv.gz -- coordinates, joined via locations.pid == places.id
+License: CC BY 3.0 (Ancient World Mapping Center / ISAW) -- attribution required in-app.
 
-FIXED 2026-09-05, two real bugs found from the first live run:
-1. Jerusalem (and 45 other places) failed to match because Pleiades titles
-   are often COMPOUND strings, e.g. Jerusalem's real title is
-   "Ierusalem/Hierosolyma/Col. Aelia Capitolina" -- confirmed directly from
-   Pleiades' own site. Exact-match on the whole title missed this. Fixed by
-   also indexing each "/"-separated component, plus a NAME_ALIASES table for
-   known classical-spelling cases.
-2. Some Pleiades locations are LineStrings/Polygons (roads, regions), not
-   simple Points, so their geometry coordinates are nested lists of many
-   points -- the original code's naive [0]/[1] indexing grabbed two whole
-   points instead of two numbers, and Postgres correctly rejected the insert.
-   Fixed via extract_representative_point(), which averages all points in
-   any geometry shape into one representative coordinate.
+FIXED 2026-09-05, three real bugs found from live runs:
+1. Jerusalem (and other places) failed to match because Pleiades titles are
+   often COMPOUND strings -- Jerusalem's real title is
+   "Ierusalem/Hierosolyma/Col. Aelia Capitolina". Fixed by indexing each
+   "/"-separated component, plus a NAME_ALIASES table for known cases.
+2. Some Pleiades locations are LineStrings/Polygons, not simple Points, so
+   coordinates are nested lists -- fixed via extract_representative_point(),
+   which averages all points in any geometry shape into one coordinate.
+3. "Ephesus" was accidentally listed twice in BIBLICAL_PLACES, which crashed
+   the whole insert batch with a unique-constraint violation. Removed the
+   duplicate and added a dedup safety net so this can't happen silently again.
 
 Run: python seed_map_locations.py
 """
@@ -43,10 +37,6 @@ except OverflowError:
 PLACES_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-places-latest.csv.gz"
 LOCATIONS_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-locations-latest.csv.gz"
 
-# Known cases where Pleiades' title uses a different (usually classical
-# Latin/Greek) spelling than the common English name -- confirmed for
-# Jerusalem directly from Pleiades' own site. Add more here as the
-# "Unmatched" report from a run surfaces them.
 NAME_ALIASES = {
     "Jerusalem": ["Ierusalem"],
 }
@@ -61,7 +51,7 @@ BIBLICAL_PLACES = [
     "Apollonia", "Miletus", "Assos", "Mitylene", "Chios", "Samos", "Patara",
     "Cnidus", "Crete", "Fair Havens", "Malta", "Syracuse", "Rhegium", "Puteoli",
     "Appii Forum", "Colossae", "Laodicea", "Smyrna", "Pergamum", "Thyatira",
-    "Sardis", "Philadelphia", "Patmos", "Alexandria", "Cyrene", "Ephesus",
+    "Sardis", "Philadelphia", "Patmos", "Alexandria", "Cyrene",
 ]
 
 
@@ -177,6 +167,14 @@ def run():
         print(f"Unmatched ({len(unmatched)}):")
         for u in unmatched:
             print(f"  - {u}")
+
+    seen_names = set()
+    deduped_rows = []
+    for r in rows:
+        if r["name"] not in seen_names:
+            seen_names.add(r["name"])
+            deduped_rows.append(r)
+    rows = deduped_rows
 
     if not rows:
         raise RuntimeError("Matched 0 places -- check the sample id/pid formats printed above.")
