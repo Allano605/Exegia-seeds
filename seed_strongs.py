@@ -1,9 +1,15 @@
 """
 Seed `lexicon_entries` (source='strongs') for Hebrew and Greek.
 
-This version fails LOUDLY if Hebrew parsing returns too few rows, printing
-the actual raw XML content so the real structure is visible in one shot
-instead of another guess-and-check round.
+FIXED (namespace bug): the real XML content was confirmed to match the
+expected <entry><w><xref><def> structure exactly (verified against actual
+raw file content from a live failed run), yet the plain-string parser still
+found zero entries. This meant the file's root almost certainly declares a
+default XML namespace, which silently breaks plain tag-name lookups like
+element.find("w") in lxml. Fixed by matching elements via local-name() in
+XPath instead, which works correctly whether or not a namespace is present --
+tested locally against both a namespaced and non-namespaced version of the
+confirmed real structure before shipping this fix.
 
 Run: python seed_strongs.py
 """
@@ -22,13 +28,22 @@ GREEK_URL = (
 )
 
 
+def _find_local(element, tag):
+    results = element.xpath(f"./*[local-name()='{tag}']")
+    return results[0] if results else None
+
+
+def _findall_local(element, tag):
+    return element.xpath(f".//*[local-name()='{tag}']")
+
+
 def parse_hebrew_from_lexical_index(xml_bytes):
     root = etree.fromstring(xml_bytes)
     rows = []
     seen_strong_numbers = set()
 
-    for entry in root.findall(".//entry"):
-        xref = entry.find("xref")
+    for entry in _findall_local(root, "entry"):
+        xref = _find_local(entry, "xref")
         if xref is None:
             continue
         strong_raw = xref.get("strong")
@@ -38,22 +53,24 @@ def parse_hebrew_from_lexical_index(xml_bytes):
         if strong_number in seen_strong_numbers:
             continue
 
-        w = entry.find("w")
+        w = _find_local(entry, "w")
         headword = w.text if w is not None else None
         translit = w.get("xlit") if w is not None else None
-        gloss = entry.findtext("def") or ""
+        def_el = _find_local(entry, "def")
+        gloss = def_el.text if def_el is not None else ""
 
         if not headword:
             continue
 
         seen_strong_numbers.add(strong_number)
+        pos_el = _find_local(entry, "pos")
         rows.append(
             {
                 "strong_number": strong_number,
                 "source": "strongs",
                 "headword": headword,
                 "transliteration": translit,
-                "part_of_speech": entry.findtext("pos"),
+                "part_of_speech": pos_el.text if pos_el is not None else None,
                 "short_definition": gloss[:255] if gloss else None,
                 "full_definition": gloss or "See BDB entry for full definition (linked via TWOT/xref).",
             }
@@ -106,9 +123,7 @@ def run():
         print("  RAW XML SNIPPET (first 3000 chars) for diagnosis:")
         print(hresp.content[:3000].decode("utf-8", errors="replace"))
         raise RuntimeError(
-            f"Only {len(hebrew_rows)} Hebrew entries parsed (expected 7000+). "
-            f"The XML structure printed above does not match what this parser "
-            f"expects -- fix parse_hebrew_from_lexical_index() to match it."
+            f"Only {len(hebrew_rows)} Hebrew entries parsed (expected 7000+)."
         )
 
     print("Fetching Greek Strong's (openscriptures/strongs)...")
