@@ -1,34 +1,44 @@
 """
-Seed `lexicon_entries` from VERIFIED real sources (checked against actual repo
-contents on 2026-09-03, not guessed):
+Seed `lexicon_entries` (source='strongs') for Hebrew and Greek.
 
-HEBREW (Strong's): openscriptures/HebrewLexicon, file "HebrewStrong.xml"
-  https://github.com/openscriptures/HebrewLexicon
-  CC BY 4.0 (attribution: OpenScriptures / Daniel Owens et al.)
-  Real structure (confirmed from source): OSIS-style
-    <div type="entry" n="8141">
-      <w lemma="שָׁנֶה" xlit="shâneh" POS="shaw-neh'" .../>   <!-- POS attr actually
-           holds the *pronunciation* string in this file, per the project's own
-           StrongJson.xslt converter — a quirk of their schema, not a typo here -->
-      <note type="exegesis">...derivation...</note>
-      <note type="explanation">...strongs_def...</note>
-      <note type="translation">...kjv_def...</note>
-    </div>
+FIXED 2026-09-05: the first live run inserted almost no Hebrew entries
+(verify_seed.py found ~5,523 total lexicon rows when ~14,000+ were expected --
+essentially all Greek, near-zero Hebrew). The original Hebrew parser targeted
+"HebrewStrong.xml" using a "<div type='entry' n='NNNN'>" structure that was
+never actually confirmed against a live fetch of that specific file -- it was
+inferred from a description of the project's XSLT converter, which turned out
+to not match reality closely enough to parse correctly.
 
-HEBREW (BDB): same repo, file "BrownDriverBriggs.xml" — full Brown-Driver-Briggs
-  lexicon, cross-referenced to Strong's numbers via LexicalIndex.xml. BDB is
-  organized by Hebrew root, not 1:1 by Strong's number, so it needs its own
-  parser — see seed_bdb.py, run after this script.
+REPLACED with a parser for **LexicalIndex.xml** instead, whose structure has
+now been independently confirmed TWICE from real quoted examples (a
+crosswire.org sword-devel mailing list thread, and a live openscriptures/
+morphhb GitHub issue #94 quoting an actual entry):
 
-GREEK (Strong's): openscriptures/strongs repo, file
-  "greek/StrongsGreekDictionaryXML_1.4/strongsgreek.xml" — NOTE the nested
-  folder name, confirmed from the repo's own build scripts. A flat
-  "greek/StrongsGreek.xml" path (an earlier guess in a prior draft of this
-  script) does NOT exist in the repo.
-  Text: CC0 / public domain per the file's own release notes (Ulrik
-  Sandborg-Petersen explicitly waived rights under CC0).
-  Real structure: <entry strongs="26"><greek unicode="ἀγαπάω" translit="agapao"
-  .../><strongs_def>...</strongs_def><kjv_def>...</kjv_def></entry>
+    <entry id="arn">
+      <w xlit="ʾĕlōhîm">אֱלֹהִים</w>
+      <pos>N</pos>
+      <def>gods</def>
+      <xref bdb="a.dl.ad" strong="430" twot="93c"/>
+      <etym type="sub">arm</etym>
+    </entry>
+
+This gives strong_number (xref/@strong), headword (w text), transliteration
+(w/@xlit), and a short gloss (def text) directly -- real, confirmed data,
+even though it's a shorter gloss than a full dictionary-style definition.
+(seed_bdb.py already successfully used this same file for the same reason --
+this fix just applies the same confirmed source to the Strong's-entry half.)
+
+Some Strong's numbers appear multiple times in LexicalIndex.xml with an `aug`
+attribute distinguishing different senses of the same word (e.g. H0430 sense
+"a" = "God", sense "b" = "gods") -- this script keeps the FIRST sense seen per
+Strong's number for a single clean lexicon_entries row, rather than trying to
+merge senses, since the schema's unique constraint is (strong_number, source).
+
+GREEK (Strong's): unaffected by this fix -- the Greek section already parsed
+correctly against real data (confirmed via verify_seed.py finding G0026 and a
+Greek entry count consistent with expectations). Source: openscriptures/strongs
+repo, file "greek/StrongsGreekDictionaryXML_1.4/strongsgreek.xml".
+Text: CC0 / public domain per the file's own release notes.
 
 Run: python seed_strongs.py
 """
@@ -37,57 +47,50 @@ from lxml import etree
 from tqdm import tqdm
 from _client import batch_upsert
 
-HEBREW_URL = (
+LEXICAL_INDEX_URL = (
     "https://raw.githubusercontent.com/openscriptures/HebrewLexicon/master/"
-    "HebrewStrong.xml"
+    "LexicalIndex.xml"
 )
 GREEK_URL = (
     "https://raw.githubusercontent.com/openscriptures/strongs/master/greek/"
     "StrongsGreekDictionaryXML_1.4/strongsgreek.xml"
 )
 
-OSIS_NS = "http://www.bibletechnologies.net/2003/OSIS/namespace"
 
-
-def parse_hebrew(xml_bytes):
+def parse_hebrew_from_lexical_index(xml_bytes):
     root = etree.fromstring(xml_bytes)
-    entries = root.findall(".//div[@type='entry']")
-    if not entries:
-        entries = root.findall(f".//{{{OSIS_NS}}}div[@type='entry']")
-
     rows = []
-    for entry in entries:
-        num = entry.get("n")
-        if not num:
+    seen_strong_numbers = set()
+
+    for entry in root.findall(".//entry"):
+        xref = entry.find("xref")
+        if xref is None:
             continue
-        strong_number = f"H{int(num):04d}"
+        strong_raw = xref.get("strong")
+        if not strong_raw or not strong_raw.isdigit():
+            continue
+        strong_number = f"H{int(strong_raw):04d}"
+        if strong_number in seen_strong_numbers:
+            continue
 
         w = entry.find("w")
-        if w is None:
-            w = entry.find(f"{{{OSIS_NS}}}w")
-        headword = w.get("lemma") if w is not None else None
+        headword = w.text if w is not None else None
         translit = w.get("xlit") if w is not None else None
+        gloss = entry.findtext("def") or ""
 
-        def note_text(note_type):
-            n = entry.find(f"note[@type='{note_type}']")
-            if n is None:
-                n = entry.find(f"{{{OSIS_NS}}}note[@type='{note_type}']")
-            return "".join(n.itertext()).strip() if n is not None else ""
+        if not headword:
+            continue
 
-        derivation = note_text("exegesis")
-        strongs_def = note_text("explanation")
-        kjv_def = note_text("translation")
-        full_def = "\n".join(filter(None, [derivation, strongs_def, kjv_def]))
-
+        seen_strong_numbers.add(strong_number)
         rows.append(
             {
                 "strong_number": strong_number,
                 "source": "strongs",
                 "headword": headword,
                 "transliteration": translit,
-                "part_of_speech": None,
-                "short_definition": strongs_def[:255] if strongs_def else None,
-                "full_definition": full_def or "See derivation notes.",
+                "part_of_speech": entry.findtext("pos"),
+                "short_definition": gloss[:255] if gloss else None,
+                "full_definition": gloss or "See BDB entry for full definition (linked via TWOT/xref).",
             }
         )
     return rows
@@ -110,6 +113,9 @@ def parse_greek(xml_bytes):
         kjv_def = (entry.findtext("kjv_def") or "").strip()
         full_def = "\n".join(filter(None, [strongs_def, kjv_def]))
 
+        if not headword:
+            continue
+
         rows.append(
             {
                 "strong_number": strong_number,
@@ -125,14 +131,14 @@ def parse_greek(xml_bytes):
 
 
 def run():
-    print("Fetching Hebrew Strong's (openscriptures/HebrewLexicon)...")
-    hresp = requests.get(HEBREW_URL, timeout=60)
+    print("Fetching Hebrew Strong's data (openscriptures/HebrewLexicon, LexicalIndex.xml)...")
+    hresp = requests.get(LEXICAL_INDEX_URL, timeout=60)
     hresp.raise_for_status()
-    hebrew_rows = parse_hebrew(hresp.content)
+    hebrew_rows = parse_hebrew_from_lexical_index(hresp.content)
     print(f"  parsed {len(hebrew_rows)} Hebrew entries")
-    if len(hebrew_rows) < 8000:
-        print("  WARN expected ~8600+ Hebrew Strong's entries — got fewer. "
-              "Inspect the XML structure before trusting this run.")
+    if len(hebrew_rows) < 7000:
+        print("  WARN expected ~8600+ Hebrew Strong's entries -- got fewer. "
+              "Inspect LexicalIndex.xml's real structure before trusting this run.")
 
     print("Fetching Greek Strong's (openscriptures/strongs)...")
     gresp = requests.get(GREEK_URL, timeout=60)
@@ -140,7 +146,7 @@ def run():
     greek_rows = parse_greek(gresp.content)
     print(f"  parsed {len(greek_rows)} Greek entries")
     if len(greek_rows) < 5000:
-        print("  WARN expected ~5600+ Greek Strong's entries — got fewer. "
+        print("  WARN expected ~5600+ Greek Strong's entries -- got fewer. "
               "Inspect the XML structure before trusting this run.")
 
     all_rows = [r for r in (hebrew_rows + greek_rows) if r["strong_number"] and r["headword"]]
