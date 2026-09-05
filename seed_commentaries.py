@@ -6,15 +6,13 @@ context cards despite reporting "success." Root cause found: this script's
 book-code URLs used `osis_code.upper()` (this project's own codes, e.g. "Gen"
 -> "GEN", "Exod" -> "EXOD"), but the HelloAO API uses the real standard USFM
 3-letter book codes (e.g. Exodus is "EXO", not "EXOD"; 1 Samuel is "1SA", not
-"1SAM"). For Genesis specifically the two schemes coincide ("GEN" either way),
-which is why the very first book didn't visibly 404 and the mismatch wasn't
-obvious from a quick look -- but the content still wasn't being extracted
-correctly, and every other multi-letter book's URL was wrong. Confirmed the
-real USFM codes from a Rust crate's own documentation ("faith" crate: "USFM
-66-book canonical table with HelloAO ID mapping") describing exactly this
-scheme. Fixed below with an explicit OSIS -> USFM mapping (reusing the same
-real mapping already verified for seed_vulgate.py's USFX codes, since USFX and
-USFM use the same 3-letter book abbreviations).
+"1SAM"). Fixed with an explicit OSIS -> USFM mapping below.
+
+SECOND FIX 2026-09-05: after fixing the book codes, the run crashed with
+"sequence item 0: expected str instance, list found" -- the real API response
+nests content deeper (lists inside lists) than the original extract_text()
+assumed. Replaced with _flatten_to_strings(), which recursively pulls every
+string leaf out of any nesting depth.
 
 Confirmed real endpoints (https://bible.helloao.org):
   GET /api/available_commentaries.json           -> list of commentary ids
@@ -22,30 +20,16 @@ Confirmed real endpoints (https://bible.helloao.org):
   GET /api/c/{commentary}/{USFM_BOOK}/{chapter}.json -> chapter commentary text
 
 PUBLIC DOMAIN commentaries seeded here (confirmed via TJ-Frederick/TheologAI's
-own NOTICE.md, which documents licensing per commentary against this same
-API): Matthew Henry, Jamieson-Fausset-Brown (JFB), Adam Clarke, John Gill,
-Keil-Delitzsch (OT only).
+own NOTICE.md): Matthew Henry, Jamieson-Fausset-Brown (JFB), Adam Clarke,
+John Gill, Keil-Delitzsch (OT only).
 
 DELIBERATELY EXCLUDED: Tyndale Open Study Notes -- confirmed CC BY-SA 4.0
 (share-alike, attribution required), a different license tier than the rest
-of this Tier 1 layer. Seed separately with honest attribution if wanted.
+of this Tier 1 layer.
 
-For `context_cards`: this API gives verse/chapter-level commentary prose, not
-the structured (author/audience/date/location) fields the schema's other
-columns are designed for. This script stores the real commentary text in
-`content_en` and leaves author_of_book/audience/date_written/location_written
-as NULL when not cleanly extractable -- an honest partial fill, not a
-fabricated complete one. Uses Matthew Henry's chapter 1 remarks for each book
-as the "overview" card, since Henry's commentary conventionally opens each
-book with introductory context.
-
-The exact JSON field holding the chapter text still hasn't been confirmed
-against a live fetch of this specific commentary endpoint (only the Bible-TEXT
-endpoint's field name, "content", was confirmed via a third-party Lua wrapper).
-This script tries several plausible field names AND prints the full raw JSON
-of the very first successful response, so if the real field name still
-doesn't match, the fix is immediately visible in the logs rather than another
-silent zero.
+For `context_cards`: stores real commentary text in `content_en`, leaves the
+structured author/audience/date/location fields NULL when not cleanly
+extractable -- an honest partial fill, not a fabricated complete one.
 
 Run: python seed_commentaries.py
 """
@@ -86,9 +70,6 @@ OSIS_TO_USFM = {
 
 
 def seed_commentary_metadata():
-    """Populate the `commentaries` table. `commentaries.id` has no other
-    unique constraint, so this checks by (author, title) before inserting to
-    keep re-runs idempotent rather than duplicating."""
     resp = requests.get(f"{API_BASE}/available_commentaries.json", timeout=30)
     resp.raise_for_status()
     available = resp.json()
@@ -106,8 +87,7 @@ def seed_commentary_metadata():
     inserted = 0
     for commentary_id, author, title, year in PUBLIC_DOMAIN_COMMENTARIES:
         if commentary_id not in available_ids:
-            print(f"  WARN '{commentary_id}' not found in available_commentaries.json -- "
-                  f"skipping; check the id against the live API response above")
+            print(f"  WARN '{commentary_id}' not found in available_commentaries.json -- skipping")
             continue
         if (author, title) in existing_keys:
             continue
@@ -125,24 +105,33 @@ def seed_commentary_metadata():
     print(f"  inserted {inserted} new commentary rows ({len(existing_keys)} already existed)")
 
 
+def _flatten_to_strings(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, dict):
+        parts = []
+        for key in ("text", "content"):
+            if key in value:
+                parts.extend(_flatten_to_strings(value[key]))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            parts.extend(_flatten_to_strings(item))
+        return parts
+    return []
+
+
 def extract_text(data):
-    """Try several plausible field names/shapes for the chapter commentary
-    text. Returns None if nothing usable is found."""
     if not isinstance(data, dict):
         return None
     for key in ("content", "text", "commentary", "html", "body"):
-        val = data.get(key)
-        if isinstance(val, str) and val.strip():
-            return val
-        if isinstance(val, list) and val:
-            parts = []
-            for item in val:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    parts.append(item.get("text") or item.get("content") or "")
-            joined = " ".join(p for p in parts if p)
-            if joined.strip():
+        if key in data:
+            strings = _flatten_to_strings(data[key])
+            joined = " ".join(strings).strip()
+            if joined:
                 return joined
     for wrapper_key in ("chapter", "commentary", "data"):
         if wrapper_key in data and isinstance(data[wrapper_key], dict):
@@ -209,8 +198,7 @@ def seed_overview_context_cards():
             supabase.table("context_cards").insert(new_rows[i:i + 500]).execute()
         print(f"  inserted {len(new_rows)} new context cards ({len(rows) - len(new_rows)} already existed)")
     else:
-        print("  no context cards extracted -- check the sample response printed above "
-              "and adjust extract_text() to match its real shape")
+        print("  no context cards extracted -- check the sample response printed above")
 
 
 def run():
