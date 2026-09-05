@@ -6,24 +6,23 @@ and its README): https://atlantides.org/downloads/pleiades/dumps/
   - pleiades-places-latest.csv.gz — place metadata (id, title, description,
     featureTypes, timePeriods)
   - pleiades-locations-latest.csv.gz — coordinates, joined to places via
-    locations.pid == places.id; geometry is a GeoJSON string, e.g.
-    {"type": "Point", "coordinates": [lon, lat]} — note GeoJSON order is
-    [longitude, latitude], reversed from this schema's (latitude, longitude)
-    columns; the script swaps this explicitly.
+    locations.pid == places.id; geometry is a GeoJSON string.
 License: CC BY 3.0 (Ancient World Mapping Center / ISAW) — attribution
 required in-app.
 
-Pleiades covers the whole ancient Mediterranean/Near Eastern world, not just
-biblical sites, so this script filters to a curated list of biblical place
-names (below) rather than importing the full ~40k-place dataset. The list
-covers the Old Testament's major named locations plus every stop on Paul's
-missionary journeys and voyage to Rome (Acts 13-28) — the set `seed_journeys.py`
-needs. Matching is done by exact/near-exact title match against Pleiades'
-`title` field; ancient place names can have multiple Pleiades entries for
-different periods of the same site, so this takes the first match and prints
-what it matched so you can sanity-check against something like Nathan Cook's
-Bible Atlas for anything.
-verify before trusting a name that seems off.
+FIXED 2026-09-05, two real bugs found from the first live run:
+1. Jerusalem (and 45 other places) failed to match because Pleiades titles
+   are often COMPOUND strings, e.g. Jerusalem's real title is
+   "Ierusalem/Hierosolyma/Col. Aelia Capitolina" -- confirmed directly from
+   Pleiades' own site. Exact-match on the whole title missed this. Fixed by
+   also indexing each "/"-separated component, plus a NAME_ALIASES table for
+   known classical-spelling cases.
+2. Some Pleiades locations are LineStrings/Polygons (roads, regions), not
+   simple Points, so their geometry coordinates are nested lists of many
+   points -- the original code's naive [0]/[1] indexing grabbed two whole
+   points instead of two numbers, and Postgres correctly rejected the insert.
+   Fixed via extract_representative_point(), which averages all points in
+   any geometry shape into one representative coordinate.
 
 Run: python seed_map_locations.py
 """
@@ -36,25 +35,22 @@ import requests
 from tqdm import tqdm
 from _client import supabase
 
-# Pleiades place descriptions can be long enough to exceed Python's csv
-# module default field-size limit (131072 bytes), which is what actually
-# broke this script on its first real run against live data — not a
-# hypothetical, this is the exact error that came back. Raise the limit
-# before reading either CSV.
 try:
     csv.field_size_limit(sys.maxsize)
 except OverflowError:
-    # Some platforms (notably Windows) reject sys.maxsize here — fall back
-    # to a large-but-safe value instead.
     csv.field_size_limit(2**31 - 1)
 
 PLACES_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-places-latest.csv.gz"
 LOCATIONS_URL = "https://atlantides.org/downloads/pleiades/dumps/pleiades-locations-latest.csv.gz"
 
-# Curated biblical place names — covers OT geography + all of Acts 13-28
-# (Paul's journeys). Pleiades titles are generally the standard ancient/Latin
-# form; a few common alternate spellings are included where the site is
-# well-known under both.
+# Known cases where Pleiades' title uses a different (usually classical
+# Latin/Greek) spelling than the common English name -- confirmed for
+# Jerusalem directly from Pleiades' own site. Add more here as the
+# "Unmatched" report from a run surfaces them.
+NAME_ALIASES = {
+    "Jerusalem": ["Ierusalem"],
+}
+
 BIBLICAL_PLACES = [
     "Jerusalem", "Bethlehem", "Nazareth", "Capernaum", "Jericho", "Bethany",
     "Damascus", "Antioch", "Antioch on the Orontes", "Caesarea", "Caesarea Maritima",
@@ -80,9 +76,6 @@ def download_csv_gz(url, description):
 
 
 def _flatten_coords(coords):
-    """Recursively flatten a GeoJSON coordinates structure down to a flat
-    list of [lon, lat] pairs, regardless of nesting depth (Point vs
-    LineString vs Polygon vs Multi* all nest differently)."""
     if not coords:
         return []
     if len(coords) == 2 and all(isinstance(c, (int, float)) for c in coords):
@@ -94,16 +87,6 @@ def _flatten_coords(coords):
 
 
 def extract_representative_point(geom):
-    """Real bug fixed here: the first live run assumed every Pleiades
-    location was a simple Point ([lon, lat]), but many are LineStrings or
-    Polygons (roads, regions) whose 'coordinates' is a nested list of many
-    points -- indexing [0] and [1] on that grabbed two whole points instead
-    of two numbers, and Postgres correctly rejected inserting a list where a
-    number was expected. Fix: flatten whatever shape the geometry is into a
-    list of (lon, lat) pairs and average them into a single representative
-    point. For a Point this average is just the point itself; for a
-    LineString/Polygon it's an approximate centroid, good enough for a map
-    marker."""
     if not geom or "coordinates" not in geom:
         return None, None
     pairs = _flatten_coords(geom["coordinates"])
@@ -119,10 +102,18 @@ def run():
     locations = download_csv_gz(LOCATIONS_URL, "Pleiades locations")
 
     places_by_title = {}
+    places_by_component = {}
     for p in places:
-        title = (p.get("title") or "").strip().lower()
-        if title and title not in places_by_title:
-            places_by_title[title] = p
+        title = (p.get("title") or "").strip()
+        if not title:
+            continue
+        title_lower = title.lower()
+        if title_lower not in places_by_title:
+            places_by_title[title_lower] = p
+        for component in title.split("/"):
+            comp_lower = component.strip().lower()
+            if comp_lower and comp_lower not in places_by_component:
+                places_by_component[comp_lower] = p
 
     def normalize_id(raw_id):
         if not raw_id:
@@ -136,16 +127,24 @@ def run():
             locations_by_pid[pid] = loc
 
     if places:
-        sample_place_id = places[0].get("id")
-        print(f"  sample places.id format: {sample_place_id!r}")
+        print(f"  sample places.id format: {places[0].get('id')!r}")
     if locations:
-        sample_pid = locations[0].get("pid")
-        print(f"  sample locations.pid format: {sample_pid!r}")
+        print(f"  sample locations.pid format: {locations[0].get('pid')!r}")
+
+    def find_place(name):
+        exact = places_by_title.get(name.lower())
+        if exact:
+            return exact
+        for alias in NAME_ALIASES.get(name, []):
+            found = places_by_title.get(alias.lower()) or places_by_component.get(alias.lower())
+            if found:
+                return found
+        return places_by_component.get(name.lower())
 
     rows = []
     unmatched = []
     for name in tqdm(BIBLICAL_PLACES, desc="Matching biblical places"):
-        place = places_by_title.get(name.lower())
+        place = find_place(name)
         if not place:
             unmatched.append(name)
             continue
@@ -175,15 +174,12 @@ def run():
 
     print(f"\nMatched {len(rows)}/{len(BIBLICAL_PLACES)} places.")
     if unmatched:
-        print(f"Unmatched ({len(unmatched)}) — these need manual coordinates or a name-variant fix:")
+        print(f"Unmatched ({len(unmatched)}):")
         for u in unmatched:
             print(f"  - {u}")
 
     if not rows:
-        raise RuntimeError(
-            "Matched 0 places — the places/locations join is broken. Check the "
-            "sample id/pid formats printed above against each other."
-        )
+        raise RuntimeError("Matched 0 places -- check the sample id/pid formats printed above.")
 
     existing_resp = supabase.table("map_locations").select("name").execute()
     existing_names = {r["name"] for r in existing_resp.data}
